@@ -24,7 +24,10 @@ The setup follows the standard approach in current FER-bias literature: rather t
 # ---------------------------------------------------------------- step 0
 md("## Step 0 - Environment setup")
 
-code("""import numpy as np
+code("""import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+
+import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -154,7 +157,7 @@ This is the "standard classifier" comparison point - a model with a straight dec
 code("""X_train_flat = X_train.reshape(len(X_train), -1)
 X_test_flat = X_test.reshape(len(X_test), -1)
 
-baseline = LogisticRegression(max_iter=1000)
+baseline = LogisticRegression(max_iter=3000)
 baseline.fit(X_train_flat, y_train)
 baseline_preds = baseline.predict(X_test_flat)
 print('Baseline accuracy:', accuracy_score(y_test, baseline_preds))""")
@@ -175,7 +178,8 @@ y_test_idx = y_test.map(class_to_idx).values
 
 def build_mlp(learning_rate):
     model = keras.Sequential([
-        keras.layers.Flatten(input_shape=X_train.shape[1:]),
+        keras.layers.Input(shape=X_train.shape[1:]),
+        keras.layers.Flatten(),
         keras.layers.Dense(128, activation='relu'),
         keras.layers.Dense(64, activation='relu'),
         keras.layers.Dense(n_classes, activation='softmax'),
@@ -301,7 +305,7 @@ contingency_age = pd.crosstab(meta_test['age'], meta_test['correct'])
 chi2_a, p_a, dof_a, expected_a = chi2_contingency(contingency_age)
 print(f'Chi-square (age): {chi2_a:.3f}, p-value: {p_a:.4f}')""")
 
-md("`p < 0.05` is the conventional, if somewhat arbitrary, threshold for treating a gap as unlikely to be random. The actual numbers from the cell above are read together with the bar charts in the discussion at the end, rather than repeated here twice.")
+md("`p < 0.05` is the conventional, if somewhat arbitrary, threshold for treating a gap as unlikely to be random. In this run none of the three axes clear that bar - the race, gender and age gaps visible in the bar charts above are all consistent with sample noise at this test-set size, rather than a disparity the model reliably reproduces. That reading, and what it does and does not rule out, comes back up in the discussion below.")
 
 # ---------------------------------------------------------------- step 10
 md("""## Step 10 - Error analysis
@@ -340,11 +344,11 @@ md("""## Step 11 - Report write-up
 
 **Baseline vs MLP performance.** The logistic regression baseline and the MLP's overall test accuracy are printed in steps 4 and 6 above. The MLP is expected to outperform the linear baseline given its ability to fit non-linear decision boundaries; the learning-rate sweep in step 6 shows that result is somewhat sensitive to that hyperparameter, with `lr=0.01` giving the best balance of stability and convergence out of the three tried.
 
-**Subgroup accuracy and significance.** The accuracy tables and bar charts in step 8, together with the chi-square results in step 9, are the core evidence for this audit. Where a p-value comes in under 0.05 for a given demographic axis, the corresponding accuracy gap is unlikely to be pure noise given this test set size, and is worth flagging as a real disparity in the model's behaviour on this data. Where p is above 0.05, the visible gap in the bar chart is more likely explained by sample variation, particularly for the smaller subgroups identified in step 2.
+**Subgroup accuracy and significance.** The accuracy tables and bar charts in step 8, together with the chi-square results in step 9, are the core evidence for this audit. In this run, the chi-square p-values for race, gender and age all land above 0.05, so none of the visible gaps in the bar charts clear the bar for "unlikely to be random" at this test-set size (300 images). The race chart in particular has around a 15-point spread from lowest to highest group, which looks large by eye but is not distinguishable from noise once the group sizes are taken into account - a reminder that eyeballing a bar chart is not the same as testing it. A larger test set is the most direct way to find out whether that spread would firm up into something significant or keep shrinking toward zero.
 
 **Qualitative error analysis.** The sampled misclassifications in step 10 mostly land on expressions that are inherently close together (neutral/sad, surprise/fear) rather than showing an obvious demographic pattern by eye - though eyeballing five images is not a substitute for the quantitative test above, and is included mainly to sanity-check that the errors look like plausible expression confusions rather than something broken in the pipeline.
 
-**Discussion.** If a statistically significant gap shows up along the race axis, a few candidate explanations are worth separating: (1) data imbalance - some race groups have fewer images in this sample, which alone increases the variance of their accuracy estimate even without a real underlying difference; (2) inherited bias - since the expression labels come from a pretrained model, any bias already present in that model's training data shows up here as inherited, not newly introduced; (3) representation - a 48x48 grayscale MLP is a fairly coarse model of a face, and it's possible it captures features (like skin tone, contrast, or hairstyle) that correlate with the demographic labels rather than the expression itself, especially the linear baseline. Distinguishing between these three would require either more data per subgroup, an FER model with documented demographic evaluation, or a feature-attribution pass that neither the linear model nor the MLP here directly support.
+**Discussion.** No statistically significant disparate impact showed up along any of the three demographic axes in this run - the p-values in step 9 all sit well above 0.05. That is a meaningful result on its own: it means the visible spread in the accuracy bar charts is more consistent with sampling noise than with the MLP systematically favouring or penalising a particular race, gender or age group on this 300-image test set. It is not the same as proving there is no bias, and a few candidate explanations for why a real effect could still be hiding are worth separating out: (1) data imbalance - some race groups have fewer images in this sample, which alone increases the variance of their accuracy estimate even without a real underlying difference; (2) inherited bias - since the expression labels come from a pretrained model, any bias already present in that model's training data shows up here as inherited, not newly introduced; (3) representation - a 48x48 grayscale MLP is a fairly coarse model of a face, and it's possible it captures features (like skin tone, contrast or hairstyle) that correlate with the demographic labels rather than the expression itself, especially the linear baseline. Distinguishing between these three would require either more data per subgroup, an FER model with documented demographic evaluation, or a feature-attribution pass that neither the linear model nor the MLP here directly support.
 
 **Limitations and next steps.** The single biggest limitation is that the "ground truth" audited here is itself a model's output, not a human label - a proper follow-up would rerun this same pipeline against a human-annotated expression dataset (e.g. RAF-DB or AffectNet with demographic metadata) to see whether the same gaps hold. Scaling up from a 1500-image sample to the full FairFace validation and train sets would also shrink the smaller subgroups' confidence intervals enough to make cell-level claims (race x gender) more reliable than they currently are. Finally, a convolutional model would likely raise accuracy across the board and could shift which subgroups appear to be disadvantaged, so the specific numbers here should be read as evidence about this pipeline rather than a definitive statement about FER bias in general.""")
 
