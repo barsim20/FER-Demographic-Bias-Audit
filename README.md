@@ -4,8 +4,8 @@ Audits a pretrained facial expression recognition (FER) model for demographic bi
 
 ## Layout
 
-- `data/prepare_dataset.py` - pulls a sample of the FairFace validation set (`nateraw/fairface` on Hugging Face) and writes it out as plain jpgs plus `fairface_labels.csv`.
-- `data/fairface_labels.csv`, `data/images/` - the sampled dataset used by the notebook.
+- `data/prepare_dataset.py` - pulls the full FairFace validation set (`nateraw/fairface` on Hugging Face, close to 11k images) and writes it out as plain jpgs plus `fairface_labels.csv`.
+- `data/fairface_labels.csv`, `data/images/` - the full validation set used by the notebook.
 - `data/fer_predictions.csv` - cached expression pseudo-labels from the ViT model, so the notebook doesn't have to rerun inference on every kernel restart.
 - `notebooks/FER_Demographic_Bias_Audit.ipynb` - the full audit, from data loading through the subgroup bias analysis and report write-up.
 
