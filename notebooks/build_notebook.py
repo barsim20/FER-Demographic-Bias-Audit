@@ -17,9 +17,11 @@ md("""# FER Demographic Bias Audit
 
 This notebook audits a pretrained facial expression recognition (FER) model for demographic bias, using the FairFace dataset for age, gender and race labels.
 
-The setup follows the standard approach in current FER-bias literature: rather than training an expression classifier from scratch, we take an existing pretrained FER model, run it on FairFace to generate expression pseudo-labels, and then check whether accuracy on a downstream classifier built from those labels differs across demographic subgroups.
+The setup follows the standard approach in current FER-bias literature: rather than training an expression classifier from scratch, we take an existing pretrained FER model, run it on FairFace to generate expression pseudo-labels, and check whether those labels - and a downstream classifier trained on them - treat demographic subgroups differently.
 
-**Research question:** does a simple facial expression classifier perform equally well across race, gender and age, or are some subgroups classified less accurately than others?""")
+**Research question:** does a pretrained facial expression model label demographic subgroups differently, and does a simple classifier trained on its output inherit or amplify that difference?
+
+The notebook answers this two ways. Step 2b tests the FER model's own output directly, before any downstream model gets involved. Steps 3 onward build a linear baseline and an MLP on top of those labels and repeat the audit on the classifier's accuracy - useful as a second angle, but one step further removed from the original question, for reasons the write-up in step 2b and step 9 both get into.""")
 
 # ---------------------------------------------------------------- step 0
 md("## Step 0 - Environment setup")
@@ -44,14 +46,27 @@ np.random.seed(42)
 tf.random.set_seed(42)
 tf.config.experimental.enable_op_determinism()
 
-DATA_DIR = '../data/'""")
+DATA_DIR = '../data/'
+
+
+def chi2_and_cramers_v(a, b):
+    \"\"\"Chi-square test of independence between two categorical columns, plus
+    Cramer's V as an effect size (0 = no association, 1 = perfect association).
+    Used for both the direct label audit in step 2b and the accuracy audit in
+    step 9, so it only needs writing once.\"\"\"
+    contingency = pd.crosstab(a, b)
+    chi2, p, dof, expected = chi2_contingency(contingency)
+    n = contingency.values.sum()
+    r, k = contingency.shape
+    v = (chi2 / (n * (min(r, k) - 1))) ** 0.5
+    return chi2, p, v""")
 
 # ---------------------------------------------------------------- step 1
 md("""## Step 1 - Data acquisition: FairFace
 
-We use FairFace for the demographic labels (age, gender, race). FairFace ships with human-annotated demographics but no expression labels, so those are generated in the next step using a pretrained FER model.
+FairFace supplies the demographic labels (age, gender, race). It doesn't come with expression labels, which is what step 1b is for.
 
-This notebook works from the full FairFace validation split, close to 11k images (see `data/prepare_dataset.py`). Running the ViT model over all of them takes a while on CPU, so that step is cached to disk after the first run rather than redone every time the notebook restarts.""")
+This notebook works from the full FairFace validation split, close to 11k images (see `data/prepare_dataset.py`). Running the ViT model over all of them takes fifteen to twenty minutes on CPU, so that step gets cached to disk after the first run instead of repeating on every restart.""")
 
 code("""df = pd.read_csv(DATA_DIR + 'fairface_labels.csv')
 print(df.shape)
@@ -62,9 +77,7 @@ md("""## Step 1b - Generate pseudo-labels with a pretrained FER model
 
 Model: `trpakov/vit-face-expression`, a ViT fine-tuned on 7 expression classes (angry, disgust, fear, happy, sad, surprise, neutral).
 
-This gives us a full expression column aligned with FairFace's demographics, without training our own FER model. The cost is that we are now auditing the ViT model's own biases rather than human-annotated ground truth, since the "correct" label for each face is whatever this model says it is. That distinction matters for how every result below should be read, and it comes back up in the discussion at the end.
-
-Running the model over the full validation set takes fifteen to twenty minutes on CPU, so the predictions are cached to disk after the first run.""")
+This attaches a full expression column to FairFace's demographics without training an FER model from scratch. The tradeoff: what gets audited from here on is the ViT model's own labeling behaviour, not human-annotated ground truth. Anything biased in that model's training data is now baked into the "ground truth" this notebook treats as correct - a distinction that matters for every result below and gets revisited in the discussion.""")
 
 code("""import os
 
@@ -95,12 +108,12 @@ df[['image_path', 'gender', 'race', 'emotion_pred', 'emotion_pred_conf']].head()
 
 code("""df['emotion_pred'].value_counts()""")
 
-md("""The model does not collapse to one or two classes, which is a reasonable sign that the pseudo-labels carry real signal rather than the classifier just guessing the majority class every time. `happy` and `neutral` dominate, which lines up with FairFace being made up of mostly neutral or mildly-posed photos rather than an acted-emotion dataset - worth keeping in mind later, since a class with very few examples is hard to learn or evaluate reliably.""")
+md("""Seven classes all show up, so the model isn't just defaulting to one label - a basic check that the pseudo-labels carry signal rather than being a constant. `happy` and `neutral` dominate by a wide margin, `disgust` and `surprise` barely register. FairFace is made of ordinary ID-style photos rather than acted expressions, so a skew toward calm, neutral-to-positive faces isn't surprising. It does mean `disgust` and `surprise` are too thin to say much about individually, and it sets up something to watch for later: if `happy` is disproportionately easy for the eventual classifier to get right, any group that happens to get labeled `happy` more often will look "more accurate" for reasons that have nothing to do with how well their faces are read.""")
 
 # ---------------------------------------------------------------- step 2
 md("""## Step 2 - Exploratory data analysis
 
-Before touching a model it's worth knowing what the data actually looks like. Subgroup sizes matter a lot for interpreting the bias results later, since a gap measured on 15 images means something very different from a gap measured on 300. Race is the primary bias axis for this audit (it's FairFace's headline demographic), so it gets checked first.""")
+Group sizes get checked before anything else gets built, since a gap measured on 15 images means something different from a gap measured on 300. Race goes first - it's FairFace's headline demographic axis.""")
 
 code("""df['race'].value_counts()""")
 
@@ -128,12 +141,35 @@ print('smallest race group:', min_group_size)
 small_groups = df.groupby(['race', 'gender']).size()
 print(small_groups[small_groups < 30])""")
 
-md("""Race groups are reasonably balanced by construction since FairFace was built for this purpose, and with the full validation set even the smallest race x gender cell comes in comfortably above the 30-image threshold checked here. That's a real advantage of working from the full set rather than a smaller sample - it means an accuracy gap found later is less likely to be an artifact of one subgroup just being tiny.""")
+md("""FairFace was built to be balanced across race, and it shows - every race x gender cell in the full set clears 30 images by a wide margin. That check gets repeated later on the 20% test split specifically, since a split can easily thin out a bin that looked fine in the full data.
+
+The chart above is also the first hint at whether emotion labels track race: if the coloured bars kept the same rough proportions across every race column, predicted emotion and race would look independent by eye. They don't look identical group to group, which is exactly what step 2b tests properly.""")
+
+# ---------------------------------------------------------------- step 2b
+md("""## Step 2b - Direct audit: does the FER model's own output vary by group?
+
+Steps 3 onward build a classifier and check whether *its* accuracy varies by group. That's a real result, but it's an indirect one - it depends on how well an MLP happens to learn the ViT model's labels, which folds in the MLP's own quirks on top of whatever the ViT model is doing. The original question doesn't need a downstream classifier at all: does `emotion_pred`, straight out of the FER model, depend on race, gender or age? That's answerable directly from `df`, before any split or model gets involved.
+
+Three tests get run here (race, gender, age), so a plain 0.05 threshold overstates how much evidence is needed - Bonferroni correction divides the threshold by 3 to keep the overall false-positive rate at 5% across the family of tests. Cramer's V comes along for effect size: with a set this large, a p-value alone can't distinguish a gap worth caring about from one that's statistically real but tiny.""")
+
+code("""alpha = 0.05
+alpha_corrected = alpha / 3  # three demographic axes tested here: race, gender, age
+print(f'Bonferroni-corrected threshold for 3 tests: {alpha_corrected:.4f}')
+print()
+
+direct_results = {}
+for axis in ['race', 'gender', 'age']:
+    chi2, p, v = chi2_and_cramers_v(df[axis], df['emotion_pred'])
+    direct_results[axis] = (chi2, p, v)
+    verdict = 'significant' if p < alpha_corrected else 'not significant'
+    print(f\"{axis:8s}  chi2={chi2:8.2f}  p={p:.4g}  Cramer's V={v:.3f}  ({verdict} after correction)\")""")
+
+md("""Cramer's V for a 2x7 or 2x9 table this size is on a rough scale where under about 0.1 counts as small, 0.1-0.3 as moderate, and above 0.3 as strong - so these numbers are the ones that decide whether a significant result is also a practically meaningful one, not just a detectable one given how much data there is. Read together with the p-values above, this is the most direct answer the notebook has to the original research question: whether the FER model's raw output already differs by group, independent of anything a downstream classifier does with it.""")
 
 # ---------------------------------------------------------------- step 3
 md("""## Step 3 - Preprocessing
 
-Images get converted to grayscale pixel arrays and scaled to a 0-1 range so the model isn't thrown off by brightness differences between photos. Everything is resized down to 48x48, which is small enough to keep the baseline and MLP fast while still leaving enough detail to tell expressions apart.""")
+From here on the notebook builds and audits a downstream classifier, as a second, complementary angle on the same question. Images get converted to grayscale pixel arrays, scaled to 0-1, and resized to 48x48 - small enough to keep the baseline and MLP quick while leaving enough detail to separate expressions.""")
 
 code("""def load_image(rel_path, size=(48, 48)):
     img = load_img(DATA_DIR + rel_path, target_size=size, color_mode='grayscale')
@@ -148,12 +184,21 @@ X_train, X_test, y_train, y_test, meta_train, meta_test = train_test_split(
 
 X_train.shape, X_test.shape""")
 
-md("Keeping `meta_train` / `meta_test` alongside the split is what lets the results get sliced by race, gender and age later - the split itself only needs `X` and `y`, but the demographic columns have to travel with the same row order to stay usable afterwards.")
+md("`meta_train` / `meta_test` ride along with the split so results can be sliced by race, gender and age afterwards - the split itself only needs `X` and `y`, but the demographic columns have to stay aligned to the same rows to be usable later.")
+
+code("""age_test_counts = meta_test['age'].value_counts().sort_index()
+print(age_test_counts)
+print()
+small_test_cells = meta_test.groupby(['race', 'gender']).size()
+print('race x gender cells under 30 in the test split:')
+print(small_test_cells[small_test_cells < 30])""")
+
+md("""This is the check from step 2 repeated on `meta_test` specifically, since that's the data step 9's tests actually run on - a group clearing 30 images in the full set doesn't guarantee it still does after a 20% split takes a random fifth of it away. Any age bin (or race x gender cell) that shows up above should be read with real caution in everything that follows: an accuracy number computed on a couple dozen images swings a lot from one random split to the next, in a way a 5-figure sample doesn't.""")
 
 # ---------------------------------------------------------------- step 4
 md("""## Step 4 - Baseline: linear (softmax) classifier
 
-This is the "standard classifier" comparison point - a model with a straight decision boundary. It's expected to underperform, and that's the point: it sets a floor that the non-linear model in the next step should beat.""")
+The "standard classifier" comparison point - a straight decision boundary, expected to underperform. It sets a floor the MLP in the next step is supposed to clear.""")
 
 code("""X_train_flat = X_train.reshape(len(X_train), -1)
 X_test_flat = X_test.reshape(len(X_test), -1)
@@ -163,12 +208,12 @@ baseline.fit(X_train_flat, y_train)
 baseline_preds = baseline.predict(X_test_flat)
 print('Baseline accuracy:', accuracy_score(y_test, baseline_preds))""")
 
-md("\"Linear decision boundary\" just means the model can only separate classes with a straight line (or plane, in higher dimensions) through the pixel space. When two demographic groups' faces overlap in that space in a complicated way, a straight line struggles to tell the expression classes apart - which is the motivation for the MLP in the next step.")
+md("A linear decision boundary can only separate classes with a straight line, or a flat plane once there are more than two pixel dimensions to work with. Where two groups' faces overlap in a complicated, curved way in that pixel space, a straight cut through it won't separate them cleanly - which is the whole motivation for the MLP next.")
 
 # ---------------------------------------------------------------- step 5
 md("""## Step 5 - Non-linear model (MLP)
 
-Adding hidden layers with a non-linear activation (ReLU here) lets the model bend its decision boundary instead of relying on a straight line. That extra flexibility is what a linear model like the one above lacks.""")
+Hidden layers plus a non-linear activation (ReLU) let the decision boundary bend instead of staying flat. That's the capability the linear model above doesn't have.""")
 
 code("""n_classes = y.nunique()
 class_names = sorted(y.unique())
@@ -198,7 +243,7 @@ mlp.summary()""")
 # ---------------------------------------------------------------- step 6
 md("""## Step 6 - Training
 
-In plain terms: the model makes a guess, checks how wrong it was (the loss), and nudges its internal weights a little in the direction that reduces that wrongness. `learning_rate` controls how big that nudge is - too big and training overshoots and never settles, too small and it barely moves. Keras handles the actual gradient computation, but it's worth trying a couple of learning rates to see the effect directly rather than taking it on faith.""")
+The model guesses, measures how wrong the guess was (the loss), and nudges its weights a bit in the direction that reduces that wrongness. `learning_rate` sets the size of that nudge - too big and it overshoots and never settles, too small and it crawls. Keras runs the actual gradient computation; the point of the sweep below is to see the effect of that one number directly rather than trust it blindly.""")
 
 code("""history = mlp.fit(
     X_train, y_train_idx,
@@ -233,12 +278,12 @@ plt.legend()
 plt.title('Validation loss across learning rates')
 plt.show()""")
 
-md("""With this many training images, one epoch is over 270 batches instead of around 40, so even a small learning rate gets a lot of updates in per epoch. That changes the picture from what you'd expect on a smaller dataset: `lr=0.1` and `lr=0.01` both stay visibly jagged from epoch to epoch, overshooting the minimum on a fair number of steps, while `lr=0.001` traces a smooth, steadily-decreasing curve and actually ends up lowest by epoch 20. The lesson isn't "always pick the smallest rate" - it's that the right learning rate depends on how many gradient steps you're actually taking, not just its own value in isolation.""")
+md("""One epoch here is over 270 batches rather than the couple dozen you'd get on a small dataset, so even a small learning rate accumulates a lot of updates per epoch. `lr=0.1` and `lr=0.01` both stay jagged from epoch to epoch, overshooting on plenty of steps, while `lr=0.001` traces a smooth curve that ends up lowest by epoch 20. The takeaway isn't "smaller is always better" - it's that the right rate depends on how many gradient steps you're actually taking, which itself depends on dataset size and batch size, not on the learning rate in isolation.""")
 
 # ---------------------------------------------------------------- step 7
 md("""## Step 7 - Gradient checking demo
 
-Keras's own gradients are already implemented and verified, so this isn't something the MLP above needs. This is just a small toy demo to show the underlying idea: a numerical gradient (computed by nudging the input slightly and measuring the change in output) should match the analytical gradient computed by calculus.""")
+Keras's gradients are already implemented and verified, so the MLP above doesn't need this. It's a small standalone check that the concept behind gradient checking holds: a numerical gradient (nudge the input, measure the change in output) should land close to the calculus-derived analytical gradient.""")
 
 code("""def f(x):
     return x ** 2  # derivative is 2x
@@ -251,9 +296,9 @@ print('Numeric gradient:', numeric_gradient(f, x))
 print('Analytical gradient (2x):', 2 * x)""")
 
 # ---------------------------------------------------------------- step 8
-md("""## Step 8 - The bias audit: subgroup evaluation
+md("""## Step 8 - Subgroup evaluation of the downstream classifier
 
-This is the actual research question. The MLP trained with `lr=0.01` gets evaluated on the same held-out test set, then accuracy gets broken down by race, gender and both together.""")
+The MLP trained at `lr=0.01` gets evaluated on the held-out test set, then its accuracy gets broken down by race, gender and both together. This is the classifier-accuracy angle flagged in the introduction - complementary to step 2b, not a replacement for it, and read together with the caveat from step 3 about which test-set cells are small enough to be noisy.""")
 
 code("""mlp_preds = mlp.predict(X_test, verbose=0).argmax(axis=1)
 meta_test = meta_test.copy()
@@ -287,31 +332,30 @@ plt.tight_layout()
 plt.show()
 age_accuracy""")
 
-md("There's visible spread across race groups in the bar chart above, with some groups sitting several points higher or lower than others, and the male/female split within nearly every race group tells a fairly consistent story on its own - female accuracy comes out ahead of male accuracy in almost every row of the table. Whether either pattern is a real effect or just noise is exactly what the next step checks.")
+md("Female accuracy sits above male accuracy in nearly every row of the race x gender table, which is a pattern worth carrying into the significance test rather than reading off the bar chart alone. Race shows spread too, though less consistently than gender does. Step 9 checks both against chance.")
 
 # ---------------------------------------------------------------- step 9
 md("""## Step 9 - Statistical significance testing
 
-An accuracy gap on its own doesn't prove bias - it could easily be noise, especially in the smaller subgroups flagged back in step 2. A chi-square test on correct/incorrect counts checks whether the gap is bigger than what random variation would explain.""")
+Same logic as step 2b, applied to the downstream classifier instead of the raw FER labels: a chi-square test on correct/incorrect counts per group, Bonferroni-corrected for three tests, with Cramer's V alongside each p-value.
 
-code("""contingency_race = pd.crosstab(meta_test['race'], meta_test['correct'])
-chi2, p, dof, expected = chi2_contingency(contingency_race)
-print(f'Chi-square (race): {chi2:.3f}, p-value: {p:.4f}')
+One thing to flag before reading the numbers: `emotion_pred` is heavily skewed toward `happy` and `neutral` (step 1b). If one demographic group happens to get labeled `happy` more often than another - which step 2b tests directly - the MLP will look more "accurate" for that group simply because predicting the majority class is easier, regardless of whether it reads that group's faces any better or worse. That confound is exactly why step 2b's direct test on `df` matters: it isolates whether the FER model's labels vary by group, without this classifier-accuracy effect mixed in. The numbers below are still useful, just as evidence about what a downstream classifier does with already-biased labels, not as a clean re-measurement of the same thing.""")
 
-contingency_gender = pd.crosstab(meta_test['gender'], meta_test['correct'])
-chi2_g, p_g, dof_g, expected_g = chi2_contingency(contingency_gender)
-print(f'Chi-square (gender): {chi2_g:.3f}, p-value: {p_g:.4f}')
+code("""alpha_corrected = 0.05 / 3  # same 3-test correction as step 2b
 
-contingency_age = pd.crosstab(meta_test['age'], meta_test['correct'])
-chi2_a, p_a, dof_a, expected_a = chi2_contingency(contingency_age)
-print(f'Chi-square (age): {chi2_a:.3f}, p-value: {p_a:.4f}')""")
+downstream_results = {}
+for axis in ['race', 'gender', 'age']:
+    chi2, p, v = chi2_and_cramers_v(meta_test[axis], meta_test['correct'])
+    downstream_results[axis] = (chi2, p, v)
+    verdict = 'significant' if p < alpha_corrected else 'not significant'
+    print(f\"{axis:8s}  chi2={chi2:8.2f}  p={p:.4g}  Cramer's V={v:.3f}  ({verdict} after correction)\")""")
 
-md("`p < 0.05` is the conventional, if somewhat arbitrary, threshold for treating a gap as unlikely to be random. In this run all three axes clear that bar, gender by a wide margin and race and age more narrowly. So the gaps in the bar charts above are not just sample noise at this test-set size - the model's accuracy genuinely does move with race, gender and age on this data. What that does and does not imply comes back up in the discussion below.")
+md("`p < 0.05` uncorrected is the usual rule of thumb, but three tests were run here, so the corrected threshold from step 2b applies again. Whatever comes back significant at that stricter bar is evidence the MLP's accuracy moves with a demographic axis in a way three separate 5%-level tests together would not produce by chance; anything that only clears the uncorrected 0.05 is weaker than the write-up in step 11 treats it.")
 
 # ---------------------------------------------------------------- step 10
 md("""## Step 10 - Error analysis
 
-Accuracy tables say how often the model is wrong, not what it's actually confusing. Pulling out misclassified examples and looking at them directly is what turns a number into an actual explanation - the same face features (skin tone, facial hair, lighting) can push an ambiguous expression toward the wrong label depending on what's around it, similar to how a word's meaning can shift depending on the words next to it.""")
+An accuracy table says how often the model is wrong, not what it confuses. Pulling out actual misclassified images is what turns the number into an explanation - the same facial features (skin tone, facial hair, lighting) can tip an ambiguous expression toward the wrong label depending on the rest of the face around it, the way a word's meaning shifts with the words next to it.""")
 
 code("""errors = meta_test[~meta_test['correct']]
 errors_by_group = errors.groupby(['race', 'gender']).size().sort_values(ascending=False)
@@ -334,24 +378,26 @@ for ax, idx in zip(axes, sample_errors.index):
 plt.tight_layout()
 plt.show()""")
 
-md("""The error-count table above is already a demographic pattern on its own - male subgroups fill most of the top rows, which lines up with the gender gap found in step 9 rather than contradicting it. The handful of misclassified images pulled out below is a much smaller, visual complement to that table: mixed-up pairs tend to be expressions that already look similar in a still photo (neutral vs sad, or surprise vs fear), which is a separate observation about what the model confuses, not a replacement for the quantitative gender finding above it.""")
+md("""Male subgroups fill most of the top rows of the error-count table, tracking the gender result from step 9. The five sampled images below are a smaller, visual check on top of that count - a look at what actually gets confused (neutral with sad, surprise with fear come up more than once) rather than who it happens to. Both readings sit alongside each other; neither one substitutes for the quantitative test.""")
 
 # ---------------------------------------------------------------- step 11
 md("""## Step 11 - Report write-up
 
-**Restated research question.** Does a simple expression classifier trained on FairFace images perform equally well across demographic subgroups, or does accuracy vary in a way that isn't explained by chance?
+**Restated research question.** Does a pretrained FER model label demographic subgroups differently, and does a classifier trained on its output inherit or amplify that difference?
 
-**Data source and limitations.** Demographic labels (age, gender, race) come from FairFace, a dataset built specifically to have balanced representation across race groups. Expression labels are not part of FairFace and were generated with a pretrained ViT model (`trpakov/vit-face-expression`), which means this notebook audits that model's own labeling behaviour rather than human-annotated ground truth for expression. Any bias already present in the ViT model propagates directly into the "ground truth" used here, so a finding of "accuracy is lower for group X" should really be read as "the MLP disagrees with the ViT model's own labels more often for group X" - it does not independently confirm that either model is reading real expressions correctly for that group. The notebook works from the full FairFace validation split rather than a subset, and every race x gender cell clears the ~30-sample threshold flagged in step 2, so the subgroup results below are not an artifact of any one cell being too small to trust.
+**Data source and limitations.** Age, gender and race come from FairFace, built specifically for balanced representation across race. Expression labels are not part of FairFace - they come from `trpakov/vit-face-expression`, so what gets audited is that model's labeling behaviour, not human-annotated ground truth. Any bias already in the ViT model's training data lands directly in what this notebook treats as ground truth: "group X gets labeled happy less often" reflects the ViT model's own output, not an independently verified fact about group X's expressions. The full FairFace validation split is used throughout. Step 3's test-set size check turns up one cell worth flagging: the oldest age bin (more than 70) drops to 24 images in the 20% test split, under the 30-sample floor used elsewhere, so the age breakdown in step 9 should be read with that specific bin discounted.
 
-**Baseline vs MLP performance.** The logistic regression baseline and the MLP's overall test accuracy are printed in steps 4 and 6 above. The baseline (about 51%) and the default MLP run at `lr=0.01` (about 50%) come out close to even, with no clear edge for the non-linear model - the learning-rate sweep clarifies why: `lr=0.1` is actively unstable on this much data and lands well below both at around 38%, `lr=0.01` on its own comes out a bit lower the second time around at 48%, and `lr=0.001` is the one setting that clearly separates itself, pulling ahead of the baseline at roughly 53%. So the honest takeaway is less "the MLP beats the linear model" and more "the MLP can beat the linear model, but only once its learning rate is tuned for the amount of data it's actually training on, and a small unlucky change in that rate can just as easily put it behind."
+**Direct audit of the FER model's labels (step 2b).** This is the primary result, since it tests the research question without a downstream classifier standing in the way, on the full 10,954-row set. All three axes come back significant even after Bonferroni correction (threshold 0.0167 for three tests), but the effect sizes are not close to each other: gender's Cramer's V is 0.22, in the moderate range; age comes in at 0.11 and race at 0.08, both small. In plain terms, the ViT model's predicted-emotion mix depends fairly substantially on gender, and only mildly on race or age, even though all three gaps are too large to be chance at this sample size.
 
-**Subgroup accuracy and significance.** The accuracy tables and bar charts in step 8, together with the chi-square results in step 9, are the core evidence for this audit. All three axes come back significant here: gender by a wide margin (p < 0.0001), and race and age both narrowly (p = 0.045 and p = 0.036). Two patterns stand out. First, race accuracy ranges from about 46% (Middle Eastern) up to about 55% (Indian), roughly a 9-point spread that the significance test says is not explained by chance alone even at that size. Second, and more strikingly, female accuracy beats male accuracy in every one of the seven race groups, by as little as 2 points (Black) and as much as 21 points (Middle Eastern). That kind of consistency across every single subgroup, and across repeated runs of this same pipeline, is what makes the gender result read as a real pattern rather than a fluke of one or two rows in the table.
+**Baseline vs MLP performance.** Baseline and default-MLP (`lr=0.01`) test accuracy land close together (about 51% vs 48%), with no clear edge for the non-linear model - the learning-rate sweep explains why: `lr=0.1` and the sweep's own `lr=0.01` run both underperform the baseline, and `lr=0.001` is the one setting that pulls ahead of it, at around 53%. The pattern is "the MLP can beat the linear model, once its learning rate is matched to how much data it's training on" rather than "the MLP straightforwardly wins."
 
-**Qualitative error analysis.** The error-count table in step 10 is itself demographic evidence, not just a qualitative add-on - male subgroups dominate the top of that table, consistent with the significant gender gap above. The handful of sampled misclassified images mostly land on expressions that are inherently close together (neutral/sad, surprise/fear), which speaks to what the model confuses rather than who it's wrong about, and is included mainly to sanity-check that the errors look like plausible expression mix-ups rather than something broken in the pipeline.
+**Subgroup accuracy and significance of the downstream classifier (step 9).** All three axes are significant here too, after the same correction - but where step 2b's effect sizes were spread across small to moderate, step 9's are clustered together and uniformly small: V is 0.10 for race, 0.09 for gender, 0.10 for age. That's a genuinely different shape of result from step 2b, where gender stood well apart from the other two. Given the class-imbalance confound flagged going into step 9, that flattening is at least partly expected: a downstream classifier scored on raw accuracy will pick up some of each group's `happy`/`neutral` label mix regardless of how well it reads faces, which would tend to blur out the sharper gender signal that step 2b measures directly.
 
-**Discussion.** There is a statistically significant disparate impact here along all three demographic axes, with gender by far the strongest and most consistent of the three. Three candidate explanations are worth separating out, since they point to different fixes: (1) data imbalance - race group sizes range from about 1200 to 2100 images in this split, which is not extreme enough on its own to produce a spurious 9-point gap or a p-value this small, so imbalance alone is not a satisfying explanation for the race result, and gender is nearly balanced to begin with (5792 male vs 5162 female); (2) inherited bias - since the expression labels come from a pretrained model rather than human annotation, any demographic bias already present in that model's training data (and in whatever data FairFace's photos were originally sourced from) shows up here as inherited, not newly introduced, and the ViT model's own confidence and label distribution would be worth auditing directly as a follow-up; (3) representation - a 48x48 grayscale MLP is a fairly coarse model of a face, and it's plausible it leans on features (skin tone, contrast, hairstyle, facial hair) that correlate with race and gender rather than expression itself, especially given the linear baseline performs almost identically to the MLP. The gender gap being this consistent across every race group points more toward (2) or (3) than toward (1), since sample-size noise would not be expected to line up in the same direction seven times in a row. Pinning down which of these is actually driving it would need either a feature-attribution pass on the MLP, or rerunning this same audit with a different pretrained FER model to see whether the gender gap moves with it.
+**Qualitative error analysis.** The error-count table in step 10 lines up with the gender result reported in step 9; the five sampled images are a small supplementary look at what the model confuses (similar-looking expressions) rather than a second measurement of who it's wrong about.
 
-**Limitations and next steps.** The single biggest limitation is that the "ground truth" audited here is itself a model's output, not a human label - a proper follow-up would rerun this same pipeline against a human-annotated expression dataset (e.g. RAF-DB or AffectNet with demographic metadata) to see whether the same gaps hold. Pulling in FairFace's train split as well, on top of the full validation set already used here, would further shrink the smaller subgroups' confidence intervals and make cell-level claims (race x gender) more reliable than they currently are. Finally, a convolutional model would likely raise accuracy across the board and could shift which subgroups appear to be disadvantaged, so the specific numbers here should be read as evidence about this pipeline rather than a definitive statement about FER bias in general.""")
+**Discussion.** Two questions got asked here, and the answers agree on direction but disagree on shape. Does the FER model's own output vary by demographic group - yes, and unevenly: gender's effect (V = 0.22) is roughly twice the size of age's (0.11) and nearly three times race's (0.08). Does a downstream classifier's accuracy also vary by group - also yes, but with all three axes landing at a similarly small effect size (V around 0.09-0.10) rather than gender standing out the way it did in the direct test. Three explanations are worth keeping distinct, since they call for different follow-ups: inherited bias (the ViT model already treats groups differently at the label level, which step 2b measures directly and is the cleanest evidence in the notebook); a class-imbalance confound in the classifier stage (a group with an easier `happy`/`neutral`-heavy label mix scores higher regardless of face-reading quality, which is a plausible reason step 9's gender effect looks smaller than step 2b's - addressed by re-running step 9 conditioned on emotion class, or on a class-balanced subset); and downstream representation effects (a 48x48 grayscale MLP may lean on skin tone, contrast or hairstyle rather than expression, though the baseline performing about as well as the MLP argues against this being the dominant factor here). The step 2b result is the one that stands on its own without needing any of these three disentangled first, and gender is where it points most clearly.
+
+**Limitations and next steps.** The audited "ground truth" is a model's output, not a human label - rerunning this same two-part audit (direct label test plus downstream classifier test) against a human-annotated dataset like RAF-DB or AffectNet with demographic metadata would show whether the same pattern, and the same gender-dominant shape, holds against real annotations. Re-running step 9 conditioned on emotion class, or restricted to just the `happy`/`neutral` majority classes, would separate the class-imbalance confound from a genuine face-reading gap. Pulling in FairFace's train split would help specifically with the age-70+ test-set cell flagged in step 3. A convolutional model would likely raise accuracy across the board and could shift which groups look disadvantaged in the downstream analysis, so those specific numbers describe this pipeline, not FER bias in general - step 2b's result, by contrast, is a property of the released ViT model itself and should hold regardless of what classifier gets built on top of it.""")
 
 nb['cells'] = cells
 nbf.write(nb, 'FER_Demographic_Bias_Audit.ipynb')
